@@ -25,10 +25,12 @@ type WithdrawalMadeEvent struct {
 
 type MoneyTransferredEvent struct {
 	BaseEvent
-	TargetAccountID  string          `json:"targetAccountId"`
-	DebitedAmount    decimal.Decimal `json:"debitedAmount"`
+	TransferID       string          `json:"transferId,omitempty"` // Unique ID for the entire transfer operation
+	SourceAccountID  string          `json:"sourceAccountId"`      // Account that was debited
+	TargetAccountID  string          `json:"targetAccountId"`      // Account that was credited
+	DebitedAmount    decimal.Decimal `json:"debitedAmount"`        // Amount taken from SourceAccountID
 	DebitedCurrency  shared.Currency `json:"debitedCurrency"`
-	CreditedAmount   decimal.Decimal `json:"creditedAmount"`
+	CreditedAmount   decimal.Decimal `json:"creditedAmount"` // Amount given to TargetAccountID
 	CreditedCurrency shared.Currency `json:"creditedCurrency"`
 	ExchangeRate     decimal.Decimal `json:"exchangeRate"`
 }

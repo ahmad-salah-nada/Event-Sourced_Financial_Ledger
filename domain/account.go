@@ -154,7 +154,7 @@ func (a *Account) HandleConvertCurrency(fromAmount decimal.Decimal, fromCurrency
 	return a.handleChange(event)
 }
 
-func (a *Account) HandleTransferMoney(targetAccountID string, debitAmount decimal.Decimal, debitCurrency shared.Currency, creditAmount decimal.Decimal, creditCurrency shared.Currency, rate decimal.Decimal) error {
+func (a *Account) HandleInitiateTransfer(transferID string, targetAccountID string, debitAmount decimal.Decimal, debitCurrency shared.Currency, creditAmount decimal.Decimal, creditCurrency shared.Currency, rate decimal.Decimal) error {
 	if a.ID == "" || a.Version == 0 {
 		return NewDomainError("cannot transfer from uninitialized account")
 	}
@@ -184,29 +184,55 @@ func (a *Account) HandleTransferMoney(targetAccountID string, debitAmount decima
 		}
 		calculatedCredit := debitAmount.Mul(rate)
 		if !calculatedCredit.Equal(creditAmount) {
-			log.Printf("Warning: HandleTransferMoney - Provided credit amount %s %s differs from calculation %s %s using rate %s for account %s",
+			log.Printf("Warning: HandleInitiateTransfer - Provided credit amount %s %s differs from calculation %s %s using rate %s for account %s",
 				creditAmount.String(), creditCurrency, calculatedCredit.String(), creditCurrency, rate.String(), a.ID)
-
-			// return NewDomainError("provided credited amount %s does not match calculated amount %s using rate %s", creditAmount.String(), calculatedCredit.String(), rate.String())
 		}
 	} else {
 		if !creditAmount.Equal(debitAmount) {
 			return NewDomainError("debit (%s) and credit (%s) amounts must match for same-currency transfer (%s)", debitAmount.String(), creditAmount.String(), debitCurrency)
 		}
 		if !rate.Equal(decimal.NewFromInt(1)) {
-			log.Printf("Warning: HandleTransferMoney - Rate for same-currency transfer (%s) was %s, expected 1. Using 1.", debitCurrency, rate.String())
+			log.Printf("Warning: HandleInitiateTransfer - Rate for same-currency transfer (%s) was %s, expected 1. Using 1.", debitCurrency, rate.String())
 			rate = decimal.NewFromInt(1)
 		}
 	}
 
 	event := events.MoneyTransferredEvent{
 		BaseEvent:        events.NewBaseEvent(a.ID, a.Version+1, events.MoneyTransferredType),
+		TransferID:       transferID,
+		SourceAccountID:  a.ID,
 		TargetAccountID:  targetAccountID,
 		DebitedAmount:    debitAmount,
 		DebitedCurrency:  debitCurrency,
 		CreditedAmount:   creditAmount,
 		CreditedCurrency: creditCurrency,
 		ExchangeRate:     rate,
+	}
+	return a.handleChange(event)
+}
+
+func (a *Account) HandleReceiveTransfer(transferID string, originalSourceAccountID string, originalTargetAccountID string, debitedAmt decimal.Decimal, debitedCur shared.Currency, creditedAmt decimal.Decimal, creditedCur shared.Currency, exRate decimal.Decimal) error {
+	if a.ID == "" || a.Version == 0 {
+		return NewDomainError("cannot apply transfer credit to uninitialized account: %s", a.ID)
+	}
+	if a.ID != originalTargetAccountID {
+		log.Printf("Error: HandleReceiveTransfer called on account %s, but event's target is %s", a.ID, originalTargetAccountID)
+		return NewDomainError("mismatch: account %s is not the target %s of this transfer credit", a.ID, originalTargetAccountID)
+	}
+	if !creditedAmt.IsPositive() {
+		return NewDomainError("credited amount for transfer must be positive: %s", creditedAmt.String())
+	}
+
+	event := events.MoneyTransferredEvent{
+		BaseEvent:        events.NewBaseEvent(a.ID, a.Version+1, events.MoneyTransferredType),
+		TransferID:       transferID,
+		SourceAccountID:  originalSourceAccountID,
+		TargetAccountID:  a.ID,
+		DebitedAmount:    debitedAmt,
+		DebitedCurrency:  debitedCur,
+		CreditedAmount:   creditedAmt,
+		CreditedCurrency: creditedCur,
+		ExchangeRate:     exRate,
 	}
 	return a.handleChange(event)
 }
@@ -251,14 +277,26 @@ func (a *Account) ApplyEvent(event events.Event) error {
 		currentTo := a.getBalance(e.ToCurrency)
 		a.Balances[e.ToCurrency] = currentTo.Add(e.ToAmount)
 	case events.MoneyTransferredEvent:
-		currentBalance := a.getBalance(e.DebitedCurrency)
-		newBalance := currentBalance.Sub(e.DebitedAmount)
-		if newBalance.IsNegative() {
-			log.Printf("CRITICAL: Invariant Violation! Account %s balance for %s negative after applying debit part of %T (v%d): %s - %s = %s",
-				a.ID, e.DebitedCurrency, event, base.Version, currentBalance.String(), e.DebitedAmount.String(), newBalance.String())
-			return fmt.Errorf("invariant violation: negative balance applying debit of %T (v%d)", event, base.Version)
+		if a.ID == e.SourceAccountID {
+			currentBalance := a.getBalance(e.DebitedCurrency)
+			newBalance := currentBalance.Sub(e.DebitedAmount)
+			if newBalance.IsNegative() {
+				log.Printf("CRITICAL: Invariant Violation! Account %s (source) balance for %s negative after applying debit part of %T (v%d, TransferID: %s): %s - %s = %s",
+					a.ID, e.DebitedCurrency, event, base.Version, e.TransferID, currentBalance.String(), e.DebitedAmount.String(), newBalance.String())
+				return fmt.Errorf("invariant violation: negative balance applying debit of %T (v%d, TransferID: %s)", event, base.Version, e.TransferID)
+			}
+			a.Balances[e.DebitedCurrency] = newBalance
+		} else if a.ID == e.TargetAccountID {
+			currentBalance := a.getBalance(e.CreditedCurrency)
+			a.Balances[e.CreditedCurrency] = currentBalance.Add(e.CreditedAmount)
+
+			log.Printf("Account %s (target) credited %s %s from transfer %s (v%d). New balance: %s",
+				a.ID, e.CreditedAmount.String(), e.CreditedCurrency, e.TransferID, base.Version, a.Balances[e.CreditedCurrency].String())
+		} else {
+			log.Printf("CRITICAL: Account %s applying MoneyTransferredEvent (ID: %s, TransferID: %s) where it's neither source (%s) nor target (%s). Event's AggregateID is %s.",
+				a.ID, e.EventID, e.TransferID, e.SourceAccountID, e.TargetAccountID, e.GetBase().AggregateID)
+			return fmt.Errorf("misconfigured or misrouted MoneyTransferredEvent (ID: %s, TransferID: %s) for account %s", e.EventID, e.TransferID, a.ID)
 		}
-		a.Balances[e.DebitedCurrency] = newBalance
 	default:
 		return fmt.Errorf("apply failed: unknown event type %T for account %s", event, a.ID)
 	}

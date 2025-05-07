@@ -540,14 +540,16 @@ func TestAccountService_TransferMoney(t *testing.T) {
 			t.Errorf("expected source GBP balance 400, got %s", balances[shared.GBP])
 		}
 
-		// Verify target event store (should only have Create event)
+		balances, _ = service.GetCurrentBalance(app.GetBalanceQuery{AccountID: targetID})
+		if !balances[shared.GBP].Equal(dec("100")) { // 0 + 100
+			t.Errorf("expected target GBP balance 100, got %s", balances[shared.GBP])
+		}
+
 		targetEvts, _ := eventStore.GetEvents(targetID)
-		if len(targetEvts) != 1 {
-			t.Errorf("target account should only have 1 event, got %d", len(targetEvts))
+		if len(targetEvts) != 2 {
+			t.Errorf("target account should only have 2 event, got %d", len(targetEvts))
 		}
 	})
-
-	// NOTE: Testing the full Saga/credit part is outside the scope of this service's unit test.
 
 	t.Run("FailOnInsufficientFunds", func(t *testing.T) {
 		// Current source balance: 400 GBP

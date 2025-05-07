@@ -191,50 +191,69 @@ func (s *AccountService) TransferMoney(cmd TransferMoneyCommand) error {
 	if err != nil {
 		return fmt.Errorf("failed to load source account %s for transfer: %w", cmd.SourceAccountID, err)
 	}
-	initialVersion := sourceAccount.Version
+	initialSourceVersion := sourceAccount.Version
 
 	targetAccount, err := s.loadAccount(cmd.TargetAccountID)
 	if err != nil {
 		if errors.Is(err, domain.ErrAccountNotFound) {
-			return fmt.Errorf("target account %s not found for transfer", cmd.TargetAccountID)
+			log.Printf("Transfer failed: Target account %s not found.", cmd.TargetAccountID)
+			return fmt.Errorf("target account %s not found for transfer: %w", cmd.TargetAccountID, err)
 		}
-		return fmt.Errorf("failed to check target account %s: %w", cmd.TargetAccountID, err)
+		return fmt.Errorf("failed to load target account %s for transfer: %w", cmd.TargetAccountID, err)
 	}
-	if targetAccount == nil {
-		return fmt.Errorf("target account %s not found for transfer", cmd.TargetAccountID)
-	}
+	initialTargetVersion := targetAccount.Version
 
-	debitCurrency := cmd.Currency
+	transferID := uuid.NewString()
+
 	debitAmount := cmd.Amount
-	creditCurrency := cmd.Currency
-	creditAmount := cmd.Amount
-	rate := decimal.NewFromInt(1)
+	debitCurrency := cmd.Currency
+	creditAmount := cmd.Amount     // For same-currency transfer
+	creditCurrency := cmd.Currency // For same-currency transfer
+	rate := decimal.NewFromInt(1)  // For same-currency transfer
 
-	err = sourceAccount.HandleTransferMoney(cmd.TargetAccountID, debitAmount, debitCurrency, creditAmount, creditCurrency, rate)
+	err = sourceAccount.HandleInitiateTransfer(transferID, cmd.TargetAccountID, debitAmount, debitCurrency, creditAmount, creditCurrency, rate)
 	if err != nil {
-		if errors.Is(err, domain.ErrInsufficientFunds) {
-			log.Printf("Transfer failed for %s: %v", cmd.SourceAccountID, err)
-			return err
-		}
+		log.Printf("Transfer failed (debit phase) for source %s: %v", cmd.SourceAccountID, err)
 		return fmt.Errorf("transfer command failed for source account %s: %w", cmd.SourceAccountID, err)
 	}
 
-	changes := sourceAccount.GetUncommitedChanges()
-	if len(changes) == 0 {
-		log.Printf("TransferMoney command for source %s resulted in no state change.", cmd.SourceAccountID)
-		return nil
+	sourceChanges := sourceAccount.GetUncommitedChanges()
+	if len(sourceChanges) > 0 {
+		err = s.eventStore.SaveEvents(cmd.SourceAccountID, initialSourceVersion, sourceChanges)
+		if err != nil {
+			log.Printf("CRITICAL ERROR: Failed to save transfer debit events for account %s (TransferID: %s): %v. State is inconsistent.", cmd.SourceAccountID, transferID, err)
+			return fmt.Errorf("failed to save transfer debit events for account %s (TransferID: %s): %w. System may be in an inconsistent state", cmd.SourceAccountID, transferID, err)
+		}
+		log.Printf("Transfer (Debit) of %s %s from %s to %s successful (TransferID: %s). Source New Version: %d",
+			debitAmount.String(), debitCurrency, cmd.SourceAccountID, cmd.TargetAccountID, transferID, sourceAccount.Version)
+		s.saveSnapshotIfNeeded(sourceAccount)
+	} else {
+		log.Printf("Warning: HandleInitiateTransfer for source %s (TransferID: %s) resulted in no state change.", cmd.SourceAccountID, transferID)
 	}
-	err = s.eventStore.SaveEvents(cmd.SourceAccountID, initialVersion, changes)
+
+	err = targetAccount.HandleReceiveTransfer(transferID, cmd.SourceAccountID, cmd.TargetAccountID, debitAmount, debitCurrency, creditAmount, creditCurrency, rate)
 	if err != nil {
-		return fmt.Errorf("failed to save transfer debit events for account %s: %w", cmd.SourceAccountID, err)
+		// Should implement a compensating action for source account if this fails.
+		log.Printf("CRITICAL ERROR: Transfer partially failed (TransferID: %s). Source %s debited, but crediting target %s failed: %v. Manual intervention may be required.", transferID, cmd.SourceAccountID, cmd.TargetAccountID, err)
+		return fmt.Errorf("transfer failed during credit to target account %s (TransferID: %s): %w. Source account %s was debited. Manual intervention likely required", cmd.TargetAccountID, transferID, err, cmd.SourceAccountID)
 	}
 
-	log.Printf("Transfer (Debit) of %s %s from %s to %s successful. Source New Version: %d",
-		debitAmount.String(), debitCurrency, cmd.SourceAccountID, cmd.TargetAccountID, sourceAccount.Version)
-	s.saveSnapshotIfNeeded(sourceAccount)
+	targetChanges := targetAccount.GetUncommitedChanges()
+	if len(targetChanges) > 0 {
+		err = s.eventStore.SaveEvents(cmd.TargetAccountID, initialTargetVersion, targetChanges)
+		if err != nil {
+			// Should implement a compensating action for source account.
+			log.Printf("CRITICAL ERROR: Failed to save transfer credit events for target account %s (TransferID: %s): %v. State is inconsistent.", cmd.TargetAccountID, transferID, err)
+			return fmt.Errorf("failed to save transfer credit events for target account %s (TransferID: %s): %w. System may be in an inconsistent state", cmd.TargetAccountID, transferID, err)
+		}
+		log.Printf("Transfer (Credit) of %s %s to %s from %s successful (TransferID: %s). Target New Version: %d",
+			creditAmount.String(), creditCurrency, cmd.TargetAccountID, cmd.SourceAccountID, transferID, targetAccount.Version)
+		s.saveSnapshotIfNeeded(targetAccount)
+	} else {
+		log.Printf("Warning: HandleReceiveTransfer for target %s (TransferID: %s) resulted in no state change.", cmd.TargetAccountID, transferID)
+	}
 
-	log.Printf("Initiated transfer from %s to %s. Credit needs to be processed separately.", cmd.SourceAccountID, cmd.TargetAccountID)
-
+	log.Printf("Transfer (TransferID: %s) from %s to %s completed successfully.", transferID, cmd.SourceAccountID, cmd.TargetAccountID)
 	return nil
 }
 
